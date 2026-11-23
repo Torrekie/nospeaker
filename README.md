@@ -32,31 +32,19 @@ One command. About a minute and a half. No speakers used.
 
 ## 02 / run it
 
-`[ one line ]`
+Build this C port with Xcode or the Command Line Tools (`xcode-select --install`). The script builds one
+program for Apple Silicon and Intel Macs. Xcode 15.2 with the macOS 14.2 SDK can build both slices. Use
+`SDKROOT` to select another installed macOS SDK if needed.
 
 ```sh
-curl -fsSL a90.com/nospeaker | sh
-```
-
-Downloads the latest release to `~/.local/bin/nospeaker` and starts the show. `a90.com/nospeaker` points
-to [play.sh](play.sh) in this repo, so you can read what it runs first.
-
-`[ download ]`
-
-Grab `nospeaker.zip` from the [latest release](https://github.com/os6/nospeaker/releases/latest),
-unzip it and run `./nospeaker` in Terminal. Signed with a Developer ID and notarized by Apple.
-
-`[ from source ]`
-
-Needs Xcode or the Command Line Tools (`xcode-select --install`). Builds one program for Apple Silicon
-and Intel Macs.
-
-```sh
-git clone https://github.com/os6/nospeaker
+git clone https://github.com/Torrekie/nospeaker
 cd nospeaker
 ./build.sh
 ./nospeaker
 ```
+
+[play.sh](play.sh) installs a binary from this fork's GitHub Releases when one is available. The original
+Swift release is available from [os6/nospeaker](https://github.com/os6/nospeaker/releases/latest).
 
 ## 03 / play with it
 
@@ -71,18 +59,13 @@ cd nospeaker
 
 ## 04 / needs
 
-A Force Touch trackpad (built into MacBooks from 2015 on, or a Magic Trackpad 2 or newer), and macOS 12 or
-later on Apple Silicon, or macOS 13 or later on Intel. Without a Force Touch trackpad, it says so and exits.
+A Force Touch trackpad, either built in or a Magic Trackpad 2 or newer. The current build targets macOS 11.0
+on Apple Silicon and OS X 10.10.3 on Intel. Those are deployment targets. Hardware playback on those
+versions and on external trackpads still needs verification. The original Magic Trackpad 2 requires
+OS X 10.11 or later.
 
-```text
-tested on
-
-MacBook Pro (Mac17,10)   M5 Max   macOS 27.2.1   everything works
-```
-
-Not tested yet: Intel Macs, a Magic Trackpad, and older versions of macOS. MultitouchSupport is private, so
-older systems may lack the functions it uses, and loudness differs between trackpads. If you try it on another
-Mac, open an issue with your model, your macOS version and how it sounded.
+MultitouchSupport is private and its behavior can vary by macOS version and trackpad. If you try this port,
+include your Mac model, macOS version, trackpad and what you heard when reporting results.
 
 ## 05 / how it works
 
@@ -125,7 +108,7 @@ across: every semitone, in Hz · up: loudness, +16 to +34 dB
 It's loud from about 100 Hz to 4 kHz, with a few dead spots where the glass resonates. Its loudest, cleanest
 notes are around 1 kHz, which covers the most important part of a voice.
 
-**The voice.** macOS's own voice speaks the line into memory. Every 10 ms, linear prediction finds the voice's
+**The voice.** macOS's own voice renders the line to a temporary WAV file. Every 10 ms, linear prediction finds the voice's
 two strongest resonances (formants), its loudness and its pitch. The motor plays those two resonances as tones,
 restarted on every beat of the pitch, so they buzz like a voice instead of whistling. Hiss sounds (s, f, t)
 become quick bursts of high tones. Two resonances beat three: in a blind test they were clearer, and louder,
@@ -134,7 +117,7 @@ because the motor's strength is split fewer ways.
 It sounds robotic, and it's much easier to follow when you can read along, which is why the show types every
 line as it speaks.
 
-**The code.** One Swift file, [nospeaker.swift](nospeaker.swift), with no dependencies.
+**The code.** One C file, [nospeaker.c](nospeaker.c), using macOS system libraries.
 
 ## 06 / caveats
 

@@ -1,8 +1,6 @@
 #!/bin/sh
 # Downloads the latest nospeaker release and plays it.
 #
-#   curl -fsSL a90.com/nospeaker | sh
-#
 # It installs one file, ~/.local/bin/nospeaker. Delete that file to uninstall.
 set -e
 
@@ -13,14 +11,14 @@ fail() {
 
 [ "$(uname -s)" = "Darwin" ] || fail "this runs on macOS only (it plays through a Mac's trackpad)."
 
-url="https://github.com/os6/nospeaker/releases/latest/download/nospeaker.zip"
+url="https://github.com/Torrekie/nospeaker/releases/latest/download/nospeaker.zip"
 dest="$HOME/.local/bin"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 echo "downloading nospeaker…"
 curl -fsSL "$url" -o "$tmp/nospeaker.zip" \
-    || fail "the download failed. Check your connection, or get it from github.com/os6/nospeaker/releases"
+    || fail "the download failed. See github.com/Torrekie/nospeaker/releases or build from source."
 ditto -x -k "$tmp/nospeaker.zip" "$tmp"
 mkdir -p "$dest"
 mv -f "$tmp/nospeaker" "$dest/nospeaker"

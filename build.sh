@@ -15,28 +15,24 @@ fail() {
 
 [ "$(uname -s)" = "Darwin" ] || fail "this builds on macOS only (it drives a Mac's trackpad)."
 
-# /usr/bin/swiftc exists even without developer tools (it only offers to install them), so ask xcode-select.
-{ xcode-select -p >/dev/null 2>&1 && command -v swiftc >/dev/null 2>&1; } || fail "Swift isn't installed. Install Apple's Command Line Tools:
+sdk="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path 2>/dev/null)}" || sdk=""
+[ -d "$sdk" ] || fail "The macOS SDK wasn't found. Install Apple's Command Line Tools:
 
     xcode-select --install
 
   then run ./build.sh again."
 
-# Swift 5.7 or newer (Xcode 14 or later).
-version=$(swiftc --version 2>/dev/null | sed -n 's/.*Swift version \([0-9]*\)\.\([0-9]*\).*/\1 \2/p')
-set -- $version
-if [ -z "$1" ] || [ "$1" -lt 5 ] || { [ "$1" -eq 5 ] && [ "$2" -lt 7 ]; }; then
-    fail "this needs Swift 5.7 or newer, and found ${1:-?}.${2:-?}. Update Xcode or the Command Line Tools
-  (Software Update, or: xcode-select --install)."
-fi
-
 mkdir -p build
-echo "building for Apple Silicon…"
-swiftc -O -target arm64-apple-macos12 nospeaker.swift -o build/nospeaker-arm64 \
-    || fail "the Apple Silicon build failed (errors above). Make sure Xcode or the Command Line Tools are up to date."
-echo "building for Intel…"
-swiftc -O -target x86_64-apple-macos13 nospeaker.swift -o build/nospeaker-x86_64 \
-    || fail "the Intel build failed (errors above). Make sure Xcode or the Command Line Tools are up to date."
+build_slice() {
+    arch="$1"
+    minimum="$2"
+    echo "building for $arch (macOS $minimum and later)…"
+    xcrun clang -std=gnu11 -O2 -ffp-contract=off -isysroot "$sdk" -target "$arch-apple-macos$minimum" \
+        -framework CoreFoundation -framework AudioToolbox -framework CoreAudio -framework IOKit \
+        nospeaker.c -o "build/nospeaker-$arch" || fail "the $arch build failed (errors above)."
+}
+build_slice arm64 11.0
+build_slice x86_64 10.10.3
 
 lipo -create build/nospeaker-arm64 build/nospeaker-x86_64 -output build/nospeaker
 codesign -s - -f build/nospeaker 2>/dev/null
