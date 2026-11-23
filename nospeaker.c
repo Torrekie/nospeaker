@@ -2,6 +2,7 @@
 //
 // Make a Force Touch trackpad talk, sing, and play music by sending short
 // waveforms to its haptic motor through the private MultitouchSupport framework.
+// The sections follow the Swift implementation at commit 1fdb55f.
 
 #include <AudioToolbox/AudioToolbox.h>
 #include <Availability.h>
@@ -32,61 +33,8 @@
 #include <time.h>
 #include <unistd.h>
 
-typedef struct {
-    double hz, amp;
-} Tone;
+// MARK: - Run state, keys, clock
 
-typedef enum {
-    SCENE_INTRO, SCENE_HEART, SCENE_SWEEP, SCENE_TALK, SCENE_SING,
-    SCENE_BEAT, SCENE_RAP, SCENE_YOUR_TURN, SCENE_TOUCH, SCENE_SAY, SCENE_OUTRO
-} Scene;
-
-typedef struct {
-    Scene scene;
-    int part;
-    const char *partName;
-    double hz, level, lastPlay;
-    double f0, f1, f2;
-    char caption[1024];
-    double captionStart, captionDur;
-    double kick, snare, hat;
-    int step, bar, bars;
-    double bpm;
-    int noteRow;
-    char noteName[16];
-    bool touchSeen, touchDown;
-    double touchX, touchY, touchEnds, touchWaitUntil;
-    bool touchMissed, waitingForKey;
-    double followOpenedAt;
-    bool inputActive;
-    char inputText[281];
-    bool inputSubmitted, inputDone;
-    const char *sayStatus;
-    int sayCount, muted, actuations;
-    double started;
-    int stepDone, stepTotal;
-} LiveState;
-
-static pthread_mutex_t liveLock = PTHREAD_MUTEX_INITIALIZER;
-static LiveState state = {
-    .scene = SCENE_INTRO, .part = 1, .partName = "LOADING", .lastPlay = -9,
-    .captionDur = 1, .kick = -9, .snare = -9, .hat = -9, .step = -1,
-    .bars = 4, .bpm = 92, .noteRow = -1, .touchX = 0.5, .touchY = 0.5,
-    .followOpenedAt = -9, .sayStatus = "typing", .muted = -1
-};
-
-static void lockLive(void) { pthread_mutex_lock(&liveLock); }
-static void unlockLive(void) { pthread_mutex_unlock(&liveLock); }
-
-static LiveState snapshot(void)
-{
-    lockLive();
-    LiveState result = state;
-    unlockLive();
-    return result;
-}
-
-static const int partCount = 10;
 static atomic_bool stopRequested, skipRequested, keyPressed, jumpToCredits, inCredits;
 static double ticksPerSecond;
 static uint64_t startTicks;
@@ -112,7 +60,7 @@ static bool interrupted(void)
     return stopRequested || skipRequested || jumpToCredits;
 }
 
-static double nowSeconds(void)
+static double now(void)
 {
     return (double)(mach_absolute_time() - startTicks) / ticksPerSecond;
 }
@@ -122,155 +70,23 @@ static void waitUntil(uint64_t target)
 {
     uint64_t margin = (uint64_t)(0.0015 * ticksPerSecond);
     while (!stopRequested) {
-        uint64_t now = mach_absolute_time();
-        if (now >= target)
+        uint64_t current = mach_absolute_time();
+        if (current >= target)
             return;
-        if (target - now > margin)
-            usleep((useconds_t)((double)(target - now - margin) / ticksPerSecond * 1e6));
+        if (target - current > margin)
+            usleep((useconds_t)((double)(target - current - margin) / ticksPerSecond * 1e6));
     }
 }
 
+// Use pauseSeconds for Swift's pause function because POSIX already defines pause.
 static void pauseSeconds(double seconds)
 {
-    double end = nowSeconds() + seconds;
-    while (nowSeconds() < end && !interrupted())
+    double end = now() + seconds;
+    while (now() < end && !interrupted())
         usleep(5000);
 }
 
-static void enter(Scene scene, int part, const char *name)
-{
-    skipRequested = false;
-    lockLive();
-    state.scene = scene;
-    state.part = part;
-    state.partName = name;
-    unlockLive();
-}
-
-static void caption(const char *text, double seconds)
-{
-    lockLive();
-    snprintf(state.caption, sizeof(state.caption), "%s", text);
-    state.captionStart = nowSeconds();
-    state.captionDur = seconds;
-    unlockLive();
-}
-
-// Terminal I/O. Keep a duplicate of stdout for the canvas while the private
-// framework's own messages are redirected to /dev/null.
-static struct termios savedTermios;
-static bool terminalTaken;
-static int outFD = STDOUT_FILENO;
-static int savedOut = -1, savedErr = -1;
-static char screenBackground[32] = "\033[48;2;0;0;0m";
-static bool lightTheme;
-
-static void out(const char *text)
-{
-    size_t length = strlen(text);
-    while (length) {
-        ssize_t count = write(outFD, text, length);
-        if (count < 0 && errno == EINTR)
-            continue;
-        if (count <= 0)
-            break;
-        text += count;
-        length -= (size_t)count;
-    }
-}
-
-static void terminalSize(int *width, int *height)
-{
-    struct winsize size;
-    if (ioctl(outFD, TIOCGWINSZ, &size) == 0 && size.ws_col && size.ws_row) {
-        *width = size.ws_col;
-        *height = size.ws_row;
-    } else {
-        *width = 80;
-        *height = 24;
-    }
-}
-
-static void silenceOthers(void)
-{
-    fflush(stdout);
-    fflush(stderr);
-    int nullFD = open("/dev/null", O_WRONLY);
-    if (nullFD < 0)
-        return;
-    savedOut = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 3);
-    savedErr = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 3);
-    if (savedOut >= 0 && savedErr >= 0) {
-        outFD = savedOut;
-        dup2(nullFD, STDOUT_FILENO);
-        dup2(nullFD, STDERR_FILENO);
-    } else {
-        if (savedOut >= 0)
-            close(savedOut);
-        if (savedErr >= 0)
-            close(savedErr);
-        savedOut = savedErr = -1;
-    }
-    close(nullFD);
-}
-
-static void unsilence(void)
-{
-    if (savedOut < 0)
-        return;
-    fflush(stdout);
-    fflush(stderr);
-    dup2(savedOut, STDOUT_FILENO);
-    dup2(savedErr, STDERR_FILENO);
-    close(savedOut);
-    close(savedErr);
-    savedOut = savedErr = -1;
-    outFD = STDOUT_FILENO;
-}
-
-static void fillScreen(void)
-{
-    char cursor[32];
-    int width, height;
-    terminalSize(&width, &height);
-    char row[width + 1];
-    memset(row, ' ', (size_t)width);
-    row[width] = '\0';
-    out("\033[0m");
-    out(screenBackground);
-    out("\033[2J");
-    for (int y = 1; y <= height; y++) {
-        snprintf(cursor, sizeof(cursor), "\033[%d;1H", y);
-        out(cursor);
-        out(row);
-    }
-}
-
-static bool takeTerminal(void)
-{
-    if (tcgetattr(STDIN_FILENO, &savedTermios) < 0)
-        return false;
-    struct termios settings = savedTermios;
-    settings.c_lflag &= ~(ICANON | ECHO);
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &settings) < 0)
-        return false;
-    terminalTaken = true;
-    silenceOthers();
-    out("\033[?1049h\033[?25l\033[?1000h\033[?1002h\033[?1006h");
-    fillScreen();
-    return true;
-}
-
-static void restoreTerminal(void)
-{
-    if (!terminalTaken)
-        return;
-    terminalTaken = false;
-    out("\033[?1006l\033[?1002l\033[?1000l\033[0m\033[2J\033[?25h\033[?1049l");
-    unsilence();
-    tcsetattr(STDIN_FILENO, TCSANOW, &savedTermios);
-}
-
+static void restoreTerminal(void);
 static void stopRenderer(void);
 
 static _Noreturn void fail(const char *message, const char *headline, int code)
@@ -299,6 +115,8 @@ static _Noreturn void usageError(const char *message)
     fail(body, "nospeaker didn't understand that.", 64);
 }
 
+// MARK: - The haptic motor (MultitouchSupport, resolved at run time)
+
 // MultitouchSupport types are the calling conventions used by the framework.
 // MTActuatorOpen's second argument is zero in Apple's MultitouchHID caller.
 typedef int32_t (*ContactCallback)(const void *, const void *, int32_t, double, int32_t, void *);
@@ -323,41 +141,7 @@ static CFTypeRef motor;
 static int deviceCount;
 static bool motorBuiltIn;
 
-static mach_port_t defaultIOKitPort(void)
-{
-#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 120000
-    if (__builtin_available(macOS 12.0, *))
-        return kIOMainPortDefault;
-#endif
-    return MACH_PORT_NULL; // IOKit selects the default port for a null argument.
-}
-
-static bool isLaptop(void)
-{
-    char model[64];
-    size_t size = sizeof(model);
-    if (sysctlbyname("hw.model", model, &size, NULL, 0) == 0 && strncmp(model, "MacBook", 7) == 0)
-        return true;
-    io_service_t battery = IOServiceGetMatchingService(defaultIOKitPort(), IOServiceMatching("AppleSmartBattery"));
-    if (!battery)
-        return false;
-    IOObjectRelease(battery);
-    return true;
-}
-
-static _Noreturn void noTrackpad(bool found)
-{
-    if (!found && !isLaptop()) {
-        fail("This Mac doesn't have a built-in trackpad, and no trackpad is connected.\n"
-             "Connect a Magic Trackpad (2 or newer, the ones with Force Touch) and run it again.", NULL, 1);
-    }
-    if (!found)
-        fail("No trackpad was found. Make sure the trackpad is on and connected, then run it again.", NULL, 1);
-    fail("Found a trackpad, but couldn't open its Force Touch actuator.\n"
-         "It needs a compatible Mac with Force Touch, or a Magic Trackpad 2 or newer.", NULL, 1);
-}
-
-static void openMotor(void)
+static void loadMultitouchSupport(void)
 {
     multitouch = dlopen("/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport",
                        RTLD_NOW | RTLD_LOCAL);
@@ -380,7 +164,48 @@ static void openMotor(void)
     unregisterCallback = dlsym(multitouch, "MTUnregisterContactFrameCallback");
     deviceStart = dlsym(multitouch, "MTDeviceStart");
     deviceStop = dlsym(multitouch, "MTDeviceStop");
+}
 
+static bool macModel(char *model, size_t size)
+{
+    return sysctlbyname("hw.model", model, &size, NULL, 0) == 0;
+}
+
+static mach_port_t defaultIOKitPort(void)
+{
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 120000
+    if (__builtin_available(macOS 12.0, *))
+        return kIOMainPortDefault;
+#endif
+    return MACH_PORT_NULL; // IOKit selects the default port for a null argument.
+}
+
+static bool isLaptop(void)
+{
+    char model[64];
+    if (macModel(model, sizeof(model)) && strncmp(model, "MacBook", 7) == 0)
+        return true;
+    io_service_t battery = IOServiceGetMatchingService(defaultIOKitPort(), IOServiceMatching("AppleSmartBattery"));
+    if (!battery)
+        return false;
+    IOObjectRelease(battery);
+    return true;
+}
+
+static _Noreturn void noTrackpad(bool found)
+{
+    if (!found && !isLaptop()) {
+        fail("This Mac doesn't have a built-in trackpad, and no trackpad is connected.\n"
+             "Connect a Magic Trackpad (2 or newer, the ones with Force Touch) and run it again.", NULL, 1);
+    }
+    if (!found)
+        fail("No trackpad was found. Make sure the trackpad is on and connected, then run it again.", NULL, 1);
+    fail("Found a trackpad, but couldn't open its Force Touch actuator.\n"
+         "It needs a compatible Mac with Force Touch, or a Magic Trackpad 2 or newer.", NULL, 1);
+}
+
+static CFTypeRef openMotor(void)
+{
     if (!createDeviceList || !getDeviceID || !actuatorCreate || !actuatorOpen ||
         !actuatorClose || !actuationCreate || !actuationPlay)
         fail("This version of macOS doesn't have the trackpad functions this needs.", NULL, 1);
@@ -406,7 +231,7 @@ static void openMotor(void)
     }
 
     // Prefer the built-in motor and keep the framework's order within each group.
-    for (int builtIn = 1; builtIn >= 0 && !motor; builtIn--) {
+    for (int builtIn = 1; builtIn >= 0; builtIn--) {
         for (int i = 0; i < deviceCount; i++) {
             Device device = devices[i];
             if (device.builtIn != builtIn)
@@ -415,18 +240,24 @@ static void openMotor(void)
             if (!candidate)
                 continue;
             if (actuatorOpen(candidate, 0) == 0) {
-                motor = candidate;
+                // The retained list keeps the selected device alive for the touch scene.
                 motorDevice = device.device;
                 motorBuiltIn = device.builtIn;
-                break;
+                free(devices);
+                return candidate;
             }
             CFRelease(candidate);
         }
     }
     free(devices);
-    if (!motor)
-        noTrackpad(true);
+    noTrackpad(true);
 }
+
+typedef struct {
+    double hz, amp;
+} Tone;
+
+static void recordActuation(double hz, float level);
 
 // Each tone's strength is normalized before it is given to the driver.
 static void play(const Tone *tones, size_t count, double ms, float level)
@@ -475,13 +306,24 @@ static void play(const Tone *tones, size_t count, double ms, float level)
 
     (void)actuationPlay(actuation, motor, 0, fminf(1, fmaxf(0, level)), 0);
     CFRelease(actuation);
-    lockLive();
-    state.actuations++;
-    state.hz = tones[0].hz;
-    state.level = level;
-    state.lastPlay = nowSeconds();
-    unlockLive();
+    recordActuation(tones[0].hz, level);
 }
+
+// MARK: - The first line
+
+static void greetingLine(char line[128])
+{
+    time_t current = time(NULL);
+    struct tm local;
+    int hour = localtime_r(&current, &local) ? local.tm_hour : 12;
+    const char *hello = hour < 5 ? "You're up late." :
+                        hour < 12 ? "Good morning." :
+                        hour < 17 ? "Good afternoon." :
+                        hour < 22 ? "Good evening." : "You're up late.";
+    snprintf(line, 128, "%s I'm your trackpad. I don't have a speaker. I've been meaning to say something.", hello);
+}
+
+// MARK: - Speakers (are they muted? the proof)
 
 // Return -1 when the default audio output doesn't expose its mute or volume.
 static int speakersMuted(void)
@@ -515,6 +357,13 @@ static int speakersMuted(void)
     }
     return known ? 0 : -1;
 }
+
+// MARK: - Touch (for "play it")
+
+// The plain show redirects framework output only while opening touch tracking.
+static bool terminalTaken;
+static void silenceOthers(void);
+static void unsilence(void);
 
 typedef struct {
     bool down;
@@ -589,18 +438,7 @@ static void stopTouch(void)
     touchStarted = false;
 }
 
-static void closeMotor(void)
-{
-    stopTouch();
-    if (motor) {
-        (void)actuatorClose(motor);
-        CFRelease(motor);
-    }
-    if (deviceList)
-        CFRelease(deviceList);
-    // Keep the private framework mapped until its contact callbacks have exited.
-}
-// Speech synthesis and analysis.
+// MARK: - Speech analysis
 
 typedef struct {
     double formants[3], amps[3];
@@ -798,6 +636,59 @@ static float *readSpeechFile(const char *path, size_t *sampleCount)
     }
     *sampleCount = framesRead;
     return samples;
+}
+
+static Frames analyse(const float *samples, size_t sampleCount);
+
+static Frames render(const char *text)
+{
+    const char *temporaryRoot = getenv("TMPDIR");
+    if (!temporaryRoot || !*temporaryRoot)
+        temporaryRoot = "/tmp";
+    char directory[PATH_MAX];
+    char path[PATH_MAX];
+    int length = snprintf(directory, sizeof(directory), "%s/nospeaker.XXXXXX", temporaryRoot);
+    if (length < 0 || (size_t)length >= sizeof(directory) || !mkdtemp(directory))
+        speechFailure();
+    length = snprintf(path, sizeof(path), "%s/voice.wav", directory);
+    if (length < 0 || (size_t)length >= sizeof(path)) {
+        rmdir(directory);
+        speechFailure();
+    }
+
+    char *argv[9] = {"/usr/bin/say", "-o", path, "--file-format=WAVE", "--data-format=LEF32@16000"};
+    int argument = 5;
+    if (voiceName) {
+        argv[argument++] = "-v";
+        argv[argument++] = (char *)voiceName;
+    }
+    argv[argument] = (char *)text;
+    pid_t child;
+    if (posix_spawn(&child, argv[0], NULL, NULL, argv, environ) != 0) {
+        rmdir(directory);
+        fail("It couldn't run macOS's voice (/usr/bin/say), which it needs to talk.", NULL, 1);
+    }
+
+    int status = waitForChild(child);
+    size_t sampleCount;
+    float *samples = status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0
+        ? readSpeechFile(path, &sampleCount) : NULL;
+    unlink(path);
+    rmdir(directory);
+    if (!samples)
+        speechFailure();
+
+    Frames result = analyse(samples, sampleCount);
+    free(samples);
+    size_t first = 0;
+    while (first < result.count && result.items[first].level == 0)
+        ++first;
+    while (result.count > first && result.items[result.count - 1].level == 0)
+        --result.count;
+    result.count -= first;
+    if (first && result.count)
+        memmove(result.items, result.items + first, result.count * sizeof(*result.items));
+    return result;
 }
 
 static double lpc(const double x[WINDOW], double a[LPC_ORDER + 1])
@@ -1027,57 +918,6 @@ static Frames analyse(const float *samples, size_t sampleCount)
     return (Frames){frames, count};
 }
 
-static Frames render(const char *text)
-{
-    const char *temporaryRoot = getenv("TMPDIR");
-    if (!temporaryRoot || !*temporaryRoot)
-        temporaryRoot = "/tmp";
-    char directory[PATH_MAX];
-    char path[PATH_MAX];
-    int length = snprintf(directory, sizeof(directory), "%s/nospeaker.XXXXXX", temporaryRoot);
-    if (length < 0 || (size_t)length >= sizeof(directory) || !mkdtemp(directory))
-        speechFailure();
-    length = snprintf(path, sizeof(path), "%s/voice.wav", directory);
-    if (length < 0 || (size_t)length >= sizeof(path)) {
-        rmdir(directory);
-        speechFailure();
-    }
-
-    char *argv[9] = {"/usr/bin/say", "-o", path, "--file-format=WAVE", "--data-format=LEF32@16000"};
-    int argument = 5;
-    if (voiceName) {
-        argv[argument++] = "-v";
-        argv[argument++] = (char *)voiceName;
-    }
-    argv[argument] = (char *)text;
-    pid_t child;
-    if (posix_spawn(&child, argv[0], NULL, NULL, argv, environ) != 0) {
-        rmdir(directory);
-        fail("It couldn't run macOS's voice (/usr/bin/say), which it needs to talk.", NULL, 1);
-    }
-
-    int status = waitForChild(child);
-    size_t sampleCount;
-    float *samples = status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0
-        ? readSpeechFile(path, &sampleCount) : NULL;
-    unlink(path);
-    rmdir(directory);
-    if (!samples)
-        speechFailure();
-
-    Frames result = analyse(samples, sampleCount);
-    free(samples);
-    size_t first = 0;
-    while (first < result.count && result.items[first].level == 0)
-        ++first;
-    while (result.count > first && result.items[result.count - 1].level == 0)
-        --result.count;
-    result.count -= first;
-    if (first && result.count)
-        memmove(result.items, result.items + first, result.count * sizeof(*result.items));
-    return result;
-}
-
 static void voiceTones(Frame f, Tone tones[2])
 {
     double secondWeight = f.amps[1] * 1.8;
@@ -1086,12 +926,94 @@ static void voiceTones(Frame f, Tone tones[2])
     tones[1] = (Tone){f.formants[1], secondWeight / sum};
 }
 
-/* Musical scenes */
+// MARK: - Live state shared with the screen
+
+typedef enum {
+    SCENE_INTRO, SCENE_HEART, SCENE_SWEEP, SCENE_TALK, SCENE_SING,
+    SCENE_BEAT, SCENE_RAP, SCENE_YOUR_TURN, SCENE_TOUCH, SCENE_SAY, SCENE_OUTRO
+} Scene;
+
+typedef struct {
+    Scene scene;
+    int part;
+    const char *partName;
+    double hz, level, lastPlay;
+    double f0, f1, f2;
+    char caption[1024];
+    double captionStart, captionDur;
+    double kick, snare, hat;
+    int step, bar, bars;
+    double bpm;
+    int noteRow;
+    char noteName[16];
+    bool touchSeen, touchDown;
+    double touchX, touchY, touchEnds, touchWaitUntil;
+    bool touchMissed, waitingForKey;
+    double followOpenedAt;
+    bool inputActive;
+    char inputText[281];
+    bool inputSubmitted, inputDone;
+    const char *sayStatus;
+    int sayCount, muted, actuations;
+    double started;
+    int stepDone, stepTotal;
+} LiveState;
+
+static pthread_mutex_t liveLock = PTHREAD_MUTEX_INITIALIZER;
+static LiveState liveState = {
+    .scene = SCENE_INTRO, .part = 1, .partName = "LOADING", .lastPlay = -9,
+    .captionDur = 1, .kick = -9, .snare = -9, .hat = -9, .step = -1,
+    .bars = 4, .bpm = 92, .noteRow = -1, .touchX = 0.5, .touchY = 0.5,
+    .followOpenedAt = -9, .sayStatus = "typing", .muted = -1
+};
+
+static void lockLive(void) { pthread_mutex_lock(&liveLock); }
+static void unlockLive(void) { pthread_mutex_unlock(&liveLock); }
+
+static LiveState snapshot(void)
+{
+    lockLive();
+    LiveState result = liveState;
+    unlockLive();
+    return result;
+}
+
+static const int partCount = 10;
+
+static void enter(Scene scene, int part, const char *name)
+{
+    skipRequested = false;
+    lockLive();
+    liveState.scene = scene;
+    liveState.part = part;
+    liveState.partName = name;
+    unlockLive();
+}
+
+static void caption(const char *text, double seconds)
+{
+    lockLive();
+    snprintf(liveState.caption, sizeof(liveState.caption), "%s", text);
+    liveState.captionStart = now();
+    liveState.captionDur = seconds;
+    unlockLive();
+}
+
+static void recordActuation(double hz, float level)
+{
+    lockLive();
+    liveState.actuations++;
+    liveState.hz = hz;
+    liveState.level = level;
+    liveState.lastPlay = now();
+    unlockLive();
+}
+
+// MARK: - Notes
 
 static const char *const noteNames[] = {
     "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
 };
-static const char *const rollNotes[] = {"C7", "A6", "G6", "E6", "C6", "A5"};
 
 static double hz(const char *note)
 {
@@ -1105,18 +1027,7 @@ static double hz(const char *note)
     return 440;
 }
 
-static void noteName(double frequency, char name[16])
-{
-    int midi = (int)round(69 + 12 * log2(frequency / 440));
-    snprintf(name, 16, "%s%d", noteNames[(midi % 12 + 12) % 12], midi / 12 - 1);
-}
-
-static double randomBetween(double lower, double upper)
-{
-    uint64_t bits;
-    arc4random_buf(&bits, sizeof(bits));
-    return lower + (upper - lower) * ((double)(bits >> 11) / 9007199254740991.0);
-}
+// MARK: - The show's parts (sound)
 
 static void thump(double amplitude)
 {
@@ -1152,6 +1063,13 @@ static void sweep(double seconds)
     }
 }
 
+static double randomBetween(double lower, double upper)
+{
+    uint64_t bits;
+    arc4random_buf(&bits, sizeof(bits));
+    return lower + (upper - lower) * ((double)(bits >> 11) / 9007199254740991.0);
+}
+
 static void talk(Frames frames, const char *text)
 {
     if (frames.count == 0)
@@ -1171,9 +1089,9 @@ static void talk(Frames frames, const char *text)
                 voiceTones(frame, tones);
                 play(tones, 2, step * 1000, frame.level);
                 lockLive();
-                state.f0 = frame.f0;
-                state.f1 = frame.formants[0];
-                state.f2 = frame.formants[1];
+                liveState.f0 = frame.f0;
+                liveState.f1 = frame.formants[0];
+                liveState.f2 = frame.formants[1];
                 unlockLive();
             } else {
                 Tone tones[3];
@@ -1187,11 +1105,13 @@ static void talk(Frames frames, const char *text)
         waitUntil(start + (uint64_t)(t * ticksPerSecond));
     }
     lockLive();
-    state.f0 = 0;
-    state.f1 = 0;
-    state.f2 = 0;
+    liveState.f0 = 0;
+    liveState.f1 = 0;
+    liveState.f2 = 0;
     unlockLive();
 }
+
+static const char *const rollNotes[] = {"C7", "A6", "G6", "E6", "C6", "A5"};
 
 /* The hook glides between notes and scoops up from below at the start of each phrase. */
 static void sing(void)
@@ -1220,8 +1140,8 @@ static void sing(void)
             }
         }
         lockLive();
-        state.noteRow = row;
-        snprintf(state.noteName, sizeof(state.noteName), "%s", name);
+        liveState.noteRow = row;
+        snprintf(liveState.noteName, sizeof(liveState.noteName), "%s", name);
         unlockLive();
 
         while (t < at + sounding && !interrupted()) {
@@ -1244,7 +1164,7 @@ static void sing(void)
         }
         previous = phraseEnd ? 0 : target;
         lockLive();
-        state.noteRow = -1;
+        liveState.noteRow = -1;
         unlockLive();
         at += length;
         if (t < at) {
@@ -1278,8 +1198,8 @@ static void groove(int bars, int rapBar, Frames rap, const char *rapText)
         }
     }
     lockLive();
-    state.bpm = bpm;
-    state.bars = bars;
+    liveState.bpm = bpm;
+    liveState.bars = bars;
     unlockLive();
 
     const double rapStart = rapBar * barLength;
@@ -1293,14 +1213,14 @@ static void groove(int bars, int rapBar, Frames rap, const char *rapText)
             break;
         while (nextHit < hitCount && hits[nextHit].time <= t + 0.0005) {
             const struct Hit hit = hits[nextHit++];
-            const double when = nowSeconds();
+            const double when = now();
             lockLive();
             if (hit.kind == 0)
-                state.kick = when;
+                liveState.kick = when;
             else if (hit.kind == 1)
-                state.snare = when;
+                liveState.snare = when;
             else
-                state.hat = when;
+                liveState.hat = when;
             unlockLive();
         }
         while (firstRinging < nextHit && t - hits[firstRinging].time > 0.2)
@@ -1308,8 +1228,8 @@ static void groove(int bars, int rapBar, Frames rap, const char *rapText)
 
         const int i16 = (int)(t / sixteenth);
         lockLive();
-        state.step = i16 % 16;
-        state.bar = i16 / 16;
+        liveState.step = i16 % 16;
+        liveState.bar = i16 / 16;
         unlockLive();
         if (!rapping && t >= rapStart) {
             rapping = true;
@@ -1335,9 +1255,9 @@ static void groove(int bars, int rapBar, Frames rap, const char *rapText)
                 tones[0].amp *= frame->level;
                 tones[1].amp *= frame->level;
                 lockLive();
-                state.f0 = frame->f0;
-                state.f1 = frame->formants[0];
-                state.f2 = frame->formants[1];
+                liveState.f0 = frame->f0;
+                liveState.f1 = frame->formants[0];
+                liveState.f2 = frame->formants[1];
                 unlockLive();
             } else {
                 step = 0.004;
@@ -1393,38 +1313,40 @@ static void groove(int bars, int rapBar, Frames rap, const char *rapText)
         waitUntil(start + (uint64_t)(t * ticksPerSecond));
     }
     lockLive();
-    state.step = -1;
-    state.f0 = 0;
-    state.f1 = 0;
-    state.f2 = 0;
+    liveState.step = -1;
+    liveState.f0 = 0;
+    liveState.f1 = 0;
+    liveState.f2 = 0;
     unlockLive();
 }
+
+static void noteName(double frequency, char name[16]);
 
 /* Slide for pitch, move up for vibrato, and press with more of your finger for volume. */
 static void touchToPlay(void)
 {
     const bool touchStarted = startTouch();
     if (touchStarted) {
-        const double waitEnd = nowSeconds() + 8;
+        const double waitEnd = now() + 8;
         lockLive();
-        state.touchWaitUntil = waitEnd;
+        liveState.touchWaitUntil = waitEnd;
         unlockLive();
-        while (nowSeconds() < waitEnd && !interrupted() && !getContact().down)
+        while (now() < waitEnd && !interrupted() && !getContact().down)
             usleep(5000);
     }
     if (!touchStarted || !getContact().down) {
         lockLive();
-        state.touchMissed = true;
+        liveState.touchMissed = true;
         unlockLive();
         pauseSeconds(1.5);
         if (touchStarted)
             stopTouch();
         return;
     }
-    const double end = nowSeconds() + 12;
+    const double end = now() + 12;
     lockLive();
-    state.touchSeen = true;
-    state.touchEnds = end;
+    liveState.touchSeen = true;
+    liveState.touchEnds = end;
     unlockLive();
 
     static const char *const notes[] = {"G5", "A5", "B5", "C6", "E6", "F6", "G6", "A6", "B6", "C7"};
@@ -1435,13 +1357,13 @@ static void touchToPlay(void)
     double current = scale[4];
     double downAt = 0;
     bool lastDown = false;
-    while (nowSeconds() < end && !interrupted()) {
+    while (now() < end && !interrupted()) {
         Contact contact = getContact();
         lockLive();
-        state.touchDown = contact.down;
+        liveState.touchDown = contact.down;
         if (contact.down) {
-            state.touchX = contact.x;
-            state.touchY = contact.y;
+            liveState.touchX = contact.x;
+            liveState.touchY = contact.y;
         }
         unlockLive();
         if (!contact.down) {
@@ -1450,12 +1372,12 @@ static void touchToPlay(void)
             continue;
         }
         if (!lastDown)
-            downAt = nowSeconds();
+            downAt = now();
         lastDown = true;
 
         const int index = (int)fmin(scaleCount - 1, fmax(0, floor((double)contact.x * scaleCount)));
         current *= pow(scale[index] / current, 0.3);
-        const double age = nowSeconds() - downAt;
+        const double age = now() - downAt;
         const double depth = 0.05 + 0.45 * fmax(0, fmin(1, contact.y));
         const double f = current * pow(2, depth * sin(2 * M_PI * 6 * age) / 12);
         const double level = fmin(1, fmax(0.5, 0.3 + contact.size * 0.8));
@@ -1463,14 +1385,20 @@ static void touchToPlay(void)
         const uint64_t start = mach_absolute_time();
         play(&(Tone){f, 1}, 1, segment * 1000, (float)level);
         lockLive();
-        noteName(f, state.noteName);
+        noteName(f, liveState.noteName);
         unlockLive();
         waitUntil(start + (uint64_t)(segment * ticksPerSecond));
     }
     lockLive();
-    state.touchDown = false;
+    liveState.touchDown = false;
     unlockLive();
     stopTouch();
+}
+
+static void noteName(double frequency, char name[16])
+{
+    int midi = (int)round(69 + 12 * log2(frequency / 440));
+    snprintf(name, 16, "%s%d", noteNames[(midi % 12 + 12) % 12], midi / 12 - 1);
 }
 
 /* An arpeggio leads up to the most resonant closing note. */
@@ -1505,26 +1433,26 @@ static void sayAnything(void)
 {
     for (int i = 0; i < 5 && !stopRequested && !jumpToCredits; ++i) {
         lockLive();
-        state.inputActive = true;
-        state.inputText[0] = '\0';
-        state.inputSubmitted = false;
-        state.sayStatus = "typing";
-        state.caption[0] = '\0';
+        liveState.inputActive = true;
+        liveState.inputText[0] = '\0';
+        liveState.inputSubmitted = false;
+        liveState.sayStatus = "typing";
+        liveState.caption[0] = '\0';
         unlockLive();
 
-        double lastChange = nowSeconds();
-        char lastText[sizeof(state.inputText)] = "";
+        double lastChange = now();
+        char lastText[sizeof(liveState.inputText)] = "";
         while (!stopRequested && !jumpToCredits) {
             LiveState current = snapshot();
             if (current.inputSubmitted || current.inputDone)
                 break;
             if (strcmp(current.inputText, lastText) != 0) {
                 memcpy(lastText, current.inputText, sizeof(lastText));
-                lastChange = nowSeconds();
+                lastChange = now();
             }
-            if (nowSeconds() - lastChange > 25) {
+            if (now() - lastChange > 25) {
                 lockLive();
-                state.inputDone = true;
+                liveState.inputDone = true;
                 unlockLive();
                 break;
             }
@@ -1533,7 +1461,7 @@ static void sayAnything(void)
 
         LiveState current = snapshot();
         lockLive();
-        state.inputActive = false;
+        liveState.inputActive = false;
         unlockLive();
         char *text = current.inputText + strspn(current.inputText, " \t");
         size_t length = strlen(text);
@@ -1543,26 +1471,146 @@ static void sayAnything(void)
             break;
 
         lockLive();
-        state.sayStatus = "preparing";
+        liveState.sayStatus = "preparing";
         unlockLive();
         Frames frames = render(text);
         lockLive();
-        state.sayStatus = "speaking";
-        ++state.sayCount;
+        liveState.sayStatus = "speaking";
+        ++liveState.sayCount;
         unlockLive();
         talk(frames, text);
         free(frames.items);
         pauseSeconds(0.6);
     }
     lockLive();
-    state.inputActive = false;
+    liveState.inputActive = false;
     unlockLive();
 }
 
-/* Terminal canvas. The render thread owns both the current and the previous frame. */
+// MARK: - Terminal
+
+// Terminal I/O. Keep a duplicate of stdout for the canvas while the private
+// framework's own messages are redirected to /dev/null.
+static struct termios savedTermios;
+static int outFD = STDOUT_FILENO;
+static int savedOut = -1, savedErr = -1;
+static char screenBackground[32] = "\033[48;2;0;0;0m";
+static bool lightTheme;
+
+static void silenceOthers(void)
+{
+    fflush(stdout);
+    fflush(stderr);
+    int nullFD = open("/dev/null", O_WRONLY);
+    if (nullFD < 0)
+        return;
+    savedOut = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 3);
+    savedErr = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 3);
+    if (savedOut >= 0 && savedErr >= 0) {
+        outFD = savedOut;
+        dup2(nullFD, STDOUT_FILENO);
+        dup2(nullFD, STDERR_FILENO);
+    } else {
+        if (savedOut >= 0)
+            close(savedOut);
+        if (savedErr >= 0)
+            close(savedErr);
+        savedOut = savedErr = -1;
+    }
+    close(nullFD);
+}
+
+static void unsilence(void)
+{
+    if (savedOut < 0)
+        return;
+    fflush(stdout);
+    fflush(stderr);
+    dup2(savedOut, STDOUT_FILENO);
+    dup2(savedErr, STDERR_FILENO);
+    close(savedOut);
+    close(savedErr);
+    savedOut = savedErr = -1;
+    outFD = STDOUT_FILENO;
+}
+
+static void out(const char *text)
+{
+    size_t length = strlen(text);
+    while (length) {
+        ssize_t count = write(outFD, text, length);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0)
+            break;
+        text += count;
+        length -= (size_t)count;
+    }
+}
+
+static void fillScreen(void);
+
+static bool takeTerminal(void)
+{
+    if (tcgetattr(STDIN_FILENO, &savedTermios) < 0)
+        return false;
+    struct termios settings = savedTermios;
+    settings.c_lflag &= ~(ICANON | ECHO);
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &settings) < 0)
+        return false;
+    terminalTaken = true;
+    silenceOthers();
+    out("\033[?1049h\033[?25l\033[?1000h\033[?1002h\033[?1006h");
+    fillScreen();
+    return true;
+}
+
+static void restoreTerminal(void)
+{
+    if (!terminalTaken)
+        return;
+    terminalTaken = false;
+    out("\033[?1006l\033[?1002l\033[?1000l\033[0m\033[2J\033[?25h\033[?1049l");
+    unsilence();
+    tcsetattr(STDIN_FILENO, TCSANOW, &savedTermios);
+}
+
+static void terminalSize(int *width, int *height);
+
+static void fillScreen(void)
+{
+    char cursor[32];
+    int width, height;
+    terminalSize(&width, &height);
+    char row[width + 1];
+    memset(row, ' ', (size_t)width);
+    row[width] = '\0';
+    out("\033[0m");
+    out(screenBackground);
+    out("\033[2J");
+    for (int y = 1; y <= height; y++) {
+        snprintf(cursor, sizeof(cursor), "\033[%d;1H", y);
+        out(cursor);
+        out(row);
+    }
+}
+
+static void terminalSize(int *width, int *height)
+{
+    struct winsize size;
+    if (ioctl(outFD, TIOCGWINSZ, &size) == 0 && size.ws_col && size.ws_row) {
+        *width = size.ws_col;
+        *height = size.ws_row;
+    } else {
+        *width = 80;
+        *height = 24;
+    }
+}
+
+// MARK: - Terminal canvas
 
 enum { canvasWidth = 80, canvasHeight = 24, canvasArea = canvasWidth * canvasHeight };
-enum { inkC = 255, bodyC = 251, midC = 247, dimC = 243, ruleC = 240, faintC = 236, paperC = 16 };
+enum { paperC = 16 };
 
 typedef struct {
     char glyph[32];
@@ -1570,14 +1618,7 @@ typedef struct {
     bool bold;
 } Cell;
 
-typedef struct {
-    Cell cells[canvasArea];
-    Cell shown[canvasArea];
-    bool hasShown;
-} Canvas;
-
 static char rgbTable[256][12];
-static const char *const spinner[] = {"|", "/", "-", "\\"};
 
 static void applyTheme(bool light)
 {
@@ -1595,21 +1636,11 @@ static void applyTheme(bool light)
     snprintf(screenBackground, sizeof(screenBackground), "\033[48;2;%sm", rgbTable[paperC]);
 }
 
-static void formatLocalizedInteger(int number, char *buffer, size_t size)
-{
-    CFLocaleRef locale = CFLocaleCopyCurrent();
-    CFNumberFormatterRef formatter = CFNumberFormatterCreate(NULL, locale, kCFNumberFormatterDecimalStyle);
-    CFStringRef formatted = formatter
-        ? CFNumberFormatterCreateStringWithValue(NULL, formatter, kCFNumberIntType, &number)
-        : NULL;
-    if (!formatted || !CFStringGetCString(formatted, buffer, (CFIndex)size, kCFStringEncodingUTF8))
-        snprintf(buffer, size, "%d", number);
-    if (formatted)
-        CFRelease(formatted);
-    if (formatter)
-        CFRelease(formatter);
-    CFRelease(locale);
-}
+typedef struct {
+    Cell cells[canvasArea];
+    Cell shown[canvasArea];
+    bool hasShown;
+} Canvas;
 
 static const char *firstNonASCII(const char *text)
 {
@@ -1633,6 +1664,13 @@ static int textLength(const char *text)
     }
     CFRelease(string);
     return length;
+}
+
+static void canvasClear(Canvas *canvas)
+{
+    const Cell blank = {.glyph = " ", .fg = 250, .bg = paperC};
+    for (int i = 0; i < canvasArea; ++i)
+        canvas->cells[i] = blank;
 }
 
 static void putGlyph(Canvas *canvas, int x, int y, const char *glyph, size_t length, uint8_t fg, uint8_t bg, bool bold)
@@ -1729,6 +1767,43 @@ static void sendChanges(Canvas *canvas, int originX, int originY)
     }
 }
 
+// MARK: - Look
+
+enum { inkC = 255, bodyC = 251, midC = 247, dimC = 243, ruleC = 240, faintC = 236 };
+
+static void copyTextPrefix(const char *text, int count, char *output, size_t size)
+{
+    if (!*firstNonASCII(text)) {
+        size_t length = strlen(text);
+        if ((size_t)count < length)
+            length = (size_t)count;
+        if (length >= size)
+            length = size - 1;
+        memcpy(output, text, length);
+        output[length] = '\0';
+        return;
+    }
+    output[0] = '\0';
+    CFStringRef string = CFStringCreateWithCString(NULL, text, kCFStringEncodingUTF8);
+    if (!string)
+        return;
+    CFIndex end = 0;
+    for (CFIndex length = CFStringGetLength(string); end < length && count > 0; --count) {
+        CFRange range = CFStringGetRangeOfComposedCharactersAtIndex(string, end);
+        end = range.location + range.length;
+    }
+    CFIndex bytes = 0;
+    CFStringGetBytes(string, CFRangeMake(0, end), kCFStringEncodingUTF8, 0, false,
+                     (UInt8 *)output, (CFIndex)size - 1, &bytes);
+    output[bytes] = '\0';
+    CFRelease(string);
+}
+
+static void typed(const char *text, double since, double cps, double t, char *output, size_t size)
+{
+    copyTextPrefix(text, (int)fmax(0, (t - since) * cps), output, size);
+}
+
 static void dots(const char *label, const char *value, int width, char *buffer, size_t size)
 {
     int count = width - textLength(label) - textLength(value) - 2;
@@ -1741,20 +1816,6 @@ static void dots(const char *label, const char *value, int width, char *buffer, 
     memset(buffer + bytes, '.', (size_t)count);
     buffer[bytes + count] = ' ';
     buffer[bytes + count + 1] = '\0';
-}
-
-static void asciiBar(double value, int width, char *buffer)
-{
-    int inner = width - 2;
-    int fill = (int)(fmax(0, fmin(1, value)) * inner);
-    buffer[0] = '[';
-    memset(buffer + 1, ' ', (size_t)inner);
-    if (fill) {
-        memset(buffer + 1, '=', (size_t)fill - 1);
-        buffer[fill] = '>';
-    }
-    buffer[width - 1] = ']';
-    buffer[width] = '\0';
 }
 
 static const char *const asciiLogo[] = {
@@ -1841,6 +1902,27 @@ static void drawSlant(Canvas *canvas, const char *text, int y)
     }
 }
 
+// Classic ASCII shading, light to dense.
+static char shade(double value)
+{
+    static const char ramp[] = " .:-=+*#%@";
+    return ramp[(int)(fmax(0, fmin(1, value)) * 9 + 0.5)];
+}
+
+static void asciiBar(double value, int width, char *buffer)
+{
+    int inner = width - 2;
+    int fill = (int)(fmax(0, fmin(1, value)) * inner);
+    buffer[0] = '[';
+    memset(buffer + 1, ' ', (size_t)inner);
+    if (fill) {
+        memset(buffer + 1, '=', (size_t)fill - 1);
+        buffer[fill] = '>';
+    }
+    buffer[width - 1] = ']';
+    buffer[width] = '\0';
+}
+
 static uint8_t shimmer(int i)
 {
     static const uint8_t silver[] = {245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255,
@@ -1848,75 +1930,132 @@ static uint8_t shimmer(int i)
     return silver[i % (int)sizeof(silver)];
 }
 
-static void copyTextPrefix(const char *text, int count, char *output, size_t size)
+static const char scrollText[] =
+    "      ·  a90.com presents  NO SPEAKER  ·    the trackpad has no speaker. every sound you hear is its haptic motor, "
+    "driven through MultitouchSupport, a private macOS framework.    range: 100 to 4000 vibrations per second.    voice: "
+    "two formants, retriggered on every pitch beat.    thanks for listening.    a90.com    ";
+static const char *scrollPosition = scrollText;
+
+static const char *nextScrollGlyph(const char *glyph)
 {
-    if (!*firstNonASCII(text)) {
-        size_t length = strlen(text);
-        if ((size_t)count < length)
-            length = (size_t)count;
-        if (length >= size)
-            length = size - 1;
-        memcpy(output, text, length);
-        output[length] = '\0';
-        return;
-    }
-    output[0] = '\0';
-    CFStringRef string = CFStringCreateWithCString(NULL, text, kCFStringEncodingUTF8);
-    if (!string)
-        return;
-    CFIndex end = 0;
-    for (CFIndex length = CFStringGetLength(string); end < length && count > 0; --count) {
-        CFRange range = CFStringGetRangeOfComposedCharactersAtIndex(string, end);
-        end = range.location + range.length;
-    }
-    CFIndex bytes = 0;
-    CFStringGetBytes(string, CFRangeMake(0, end), kCFStringEncodingUTF8, 0, false,
-                     (UInt8 *)output, (CFIndex)size - 1, &bytes);
-    output[bytes] = '\0';
-    CFRelease(string);
+    /* The only multibyte glyph in the scroller is the middle dot. */
+    const char *next = glyph + ((unsigned char)*glyph < 0x80 ? 1 : 2);
+    return *next ? next : scrollText;
 }
 
-static void drawCaption(Canvas *canvas, const LiveState *s, double t, int y)
+// The renderer advances the scroller by one character at a time.
+static int marquee;
+
+// Screen memory owned by the render thread.
+enum { rollLength = 62, trailLength = 14 };
+static int rollHistory[rollLength];
+static struct { double x, y; } trail[trailLength];
+static int trailCount;
+
+static void remember(const LiveState *s, double t)
 {
-    double progress = fmax(0, fmin(1, (t - s->captionStart) / fmax(0.2, s->captionDur) * 1.15));
-    char shown[sizeof(s->caption)];
-    copyTextPrefix(s->caption, (int)(textLength(s->caption) * progress), shown, sizeof(shown));
-    const char *caret = progress >= 1 ? "”" : (int)(t * 3) % 2 == 0 ? "█" : " ";
-    char line[sizeof(shown) + 4] = "";
-    char previous[sizeof(line)] = "";
-    int lines = 0;
-    char *remaining = shown;
-    char *word;
-    while ((word = strsep(&remaining, " ")) != NULL) {
-        if (textLength(line) + textLength(word) + 1 > 64) {
-            strlcpy(previous, line, sizeof(previous));
-            strlcpy(line, word, sizeof(line));
-            ++lines;
-        } else {
-            if (*line)
-                strlcat(line, " ", sizeof(line));
-            strlcat(line, word, sizeof(line));
+    memmove(rollHistory, rollHistory + 1, (rollLength - 1) * sizeof(rollHistory[0]));
+    rollHistory[rollLength - 1] = s->scene == SCENE_SING && t - s->lastPlay < 0.1 ? s->noteRow : -1;
+    if (s->scene == SCENE_TOUCH && s->touchDown) {
+        if (trailCount == trailLength) {
+            memmove(trail, trail + 1, (trailLength - 1) * sizeof(trail[0]));
+            --trailCount;
         }
+        trail[trailCount].x = s->touchX;
+        trail[trailCount++].y = s->touchY;
     }
-    strlcat(line, caret, sizeof(line));
-    if (lines <= 1)
-        drawText(canvas, 7, y, "“", midC, true);
-    if (lines > 0)
-        drawText(canvas, 8, y++, previous, inkC, true);
-    drawText(canvas, 8, y, line, inkC, true);
 }
 
-static void drawProof(Canvas *canvas, const LiveState *s, double t, int y)
+// Scene drawers used by the common canvas composition.
+static void drawSplash(Canvas *canvas, const LiveState *s, double t);
+static void drawHeart(Canvas *canvas, const LiveState *s, double t);
+static void drawSweep(Canvas *canvas, const LiveState *s, double t);
+static void drawTalk(Canvas *canvas, const LiveState *s, double t);
+static void drawSing(Canvas *canvas, const LiveState *s);
+static void drawBeat(Canvas *canvas, const LiveState *s, double t);
+static void drawYourTurn(Canvas *canvas, const LiveState *s, double t);
+static void drawTouch(Canvas *canvas, const LiveState *s, double t);
+static void drawSay(Canvas *canvas, const LiveState *s, double t);
+static void drawOutro(Canvas *canvas, const LiveState *s, double t);
+
+static void draw(Canvas *canvas, const LiveState *s, double t)
 {
-    if (s->muted < 0)
+    canvasClear(canvas);
+
+    const char presents[] = "a90.com presents";
+    int width = logoWidth();
+    int left = (canvasWidth - width) / 2;
+    int side = (width - ((int)sizeof(presents) - 1) - 4) / 2;
+    int rightStart = left + side + (int)sizeof(presents) + 3;
+    for (int x = left; x < left + side; ++x)
+        put(canvas, x, 0, "─", dimC, false);
+    for (int x = rightStart; x < left + width; ++x)
+        put(canvas, x, 0, "─", dimC, false);
+    drawText(canvas, left + side + 2, 0, presents, bodyC, true);
+    drawLogo(canvas, 2);
+
+    switch (s->scene) {
+    case SCENE_INTRO:
+        drawSplash(canvas, s, t);
         return;
-    const char *text = s->muted
-        ? "   SPEAKERS MUTED  ·  EVERY SOUND YOU HEAR IS THE TRACKPAD   "
-        : "   SPEAKERS ARE ON  ·  MUTE YOUR MAC FIRST   ";
-    bool blink = !s->muted && (int)(t * 2.5) % 2 == 0;
-    canvasText(canvas, (canvasWidth - textLength(text)) / 2, y, text,
-               blink ? inkC : paperC, blink ? faintC : inkC, true);
+    case SCENE_HEART:
+        drawHeart(canvas, s, t);
+        break;
+    case SCENE_SWEEP:
+        drawSweep(canvas, s, t);
+        break;
+    case SCENE_TALK:
+        drawTalk(canvas, s, t);
+        break;
+    case SCENE_SING:
+        drawSing(canvas, s);
+        break;
+    case SCENE_BEAT:
+    case SCENE_RAP:
+        drawBeat(canvas, s, t);
+        break;
+    case SCENE_YOUR_TURN:
+        drawYourTurn(canvas, s, t);
+        break;
+    case SCENE_TOUCH:
+        drawTouch(canvas, s, t);
+        break;
+    case SCENE_SAY:
+        drawSay(canvas, s, t);
+        break;
+    case SCENE_OUTRO:
+        drawOutro(canvas, s, t);
+        break;
+    }
+
+    char badge[32], frequency[32], bar[11];
+    snprintf(badge, sizeof(badge), " %02d/%02d ", s->part, partCount);
+    canvasText(canvas, 1, 21, badge, paperC, inkC, true);
+    drawText(canvas, 2 + (int)strlen(badge), 21, s->partName, inkC, true);
+    bool active = t - s->lastPlay < 0.08;
+    drawText(canvas, 24, 21, "motor", dimC, false);
+    snprintf(frequency, sizeof(frequency), "%4.0f hz", s->hz);
+    drawText(canvas, 30, 21, active ? frequency : "idle", active ? inkC : dimC, active);
+    asciiBar(active ? s->level : 0, 10, bar);
+    drawText(canvas, 38, 21, bar, bodyC, false);
+    if (s->muted >= 0) {
+        const char *chip = s->muted ? " SPEAKERS MUTED " : " SPEAKERS ON · MUTE ";
+        bool blink = !s->muted && (int)(t * 2.5) % 2 == 0;
+        canvasText(canvas, 79 - textLength(chip), 21, chip,
+                   blink ? inkC : paperC, blink ? faintC : inkC, true);
+    }
+    drawText(canvas, 2, 22, "space skip · q end", faintC, false);
+    const char *glyph = scrollPosition;
+    for (int x = 0; x < canvasWidth; ++x) {
+        size_t length = (unsigned char)*glyph < 0x80 ? 1 : 2;
+        putGlyph(canvas, x, 23, glyph, length, shimmer((x + marquee) / 2), paperC, true);
+        glyph = nextScrollGlyph(glyph);
+    }
 }
+
+static void drawProof(Canvas *canvas, const LiveState *s, double t, int y);
+
+static const char *const spinner[] = {"|", "/", "-", "\\"};
 
 static void drawSplashLine(Canvas *canvas, int x, int y, const char *label, const char *value)
 {
@@ -1932,7 +2071,7 @@ static void drawSplash(Canvas *canvas, const LiveState *s, double t)
     const int done = s->stepDone;
     char line[128];
     drawText(canvas, x, 11, "$", midC, false);
-    copyTextPrefix("./nospeaker", (int)fmax(0, (t - s->started) * 30), line, sizeof(line));
+    typed("./nospeaker", s->started, 30, t, line, sizeof(line));
     drawText(canvas, x + 2, 11, line, inkC, true);
     if (done >= 1)
         drawSplashLine(canvas, x + 2, 12, "loading the trackpad's haptics", multitouch ? "ok" : "missing");
@@ -1953,6 +2092,18 @@ static void drawSplash(Canvas *canvas, const LiveState *s, double t)
     centerText(canvas, 19, "keep your hands off the trackpad until the end", dimC, false);
     bool ready = s->stepTotal > 0 && done >= s->stepTotal;
     centerText(canvas, 22, ready && s->muted != 1 ? "space to start anyway  ·  q end" : "space skip  ·  q end", dimC, false);
+}
+
+static void drawProof(Canvas *canvas, const LiveState *s, double t, int y)
+{
+    if (s->muted < 0)
+        return;
+    const char *text = s->muted
+        ? "   SPEAKERS MUTED  ·  EVERY SOUND YOU HEAR IS THE TRACKPAD   "
+        : "   SPEAKERS ARE ON  ·  MUTE YOUR MAC FIRST   ";
+    bool blink = !s->muted && (int)(t * 2.5) % 2 == 0;
+    canvasText(canvas, (canvasWidth - textLength(text)) / 2, y, text,
+               blink ? inkC : paperC, blink ? faintC : inkC, true);
 }
 
 static void drawHeart(Canvas *canvas, const LiveState *s, double t)
@@ -1998,6 +2149,36 @@ static void drawSweep(Canvas *canvas, const LiveState *s, double t)
         put(canvas, xForHz(f), 17, "v", inkC, true);
 }
 
+static void drawCaption(Canvas *canvas, const LiveState *s, double t, int y)
+{
+    double progress = fmax(0, fmin(1, (t - s->captionStart) / fmax(0.2, s->captionDur) * 1.15));
+    char shown[sizeof(s->caption)];
+    copyTextPrefix(s->caption, (int)(textLength(s->caption) * progress), shown, sizeof(shown));
+    const char *caret = progress >= 1 ? "”" : (int)(t * 3) % 2 == 0 ? "█" : " ";
+    char line[sizeof(shown) + 4] = "";
+    char previous[sizeof(line)] = "";
+    int lines = 0;
+    char *remaining = shown;
+    char *word;
+    while ((word = strsep(&remaining, " ")) != NULL) {
+        if (textLength(line) + textLength(word) + 1 > 64) {
+            strlcpy(previous, line, sizeof(previous));
+            strlcpy(line, word, sizeof(line));
+            ++lines;
+        } else {
+            if (*line)
+                strlcat(line, " ", sizeof(line));
+            strlcat(line, word, sizeof(line));
+        }
+    }
+    strlcat(line, caret, sizeof(line));
+    if (lines <= 1)
+        drawText(canvas, 7, y, "“", midC, true);
+    if (lines > 0)
+        drawText(canvas, 8, y++, previous, inkC, true);
+    drawText(canvas, 8, y, line, inkC, true);
+}
+
 static void meter(Canvas *canvas, int y, const char *label, double value, double lo, double hi)
 {
     drawText(canvas, 6, y, label, inkC, true);
@@ -2016,7 +2197,6 @@ static void drawTalk(Canvas *canvas, const LiveState *s, double t)
     meter(canvas, 14, "F0", on ? s->f0 : 0, 60, 260);
     meter(canvas, 15, "F1", on ? s->f1 : 0, 150, 1000);
     meter(canvas, 16, "F2", on ? s->f2 : 0, 600, 2800);
-    static const char ramp[] = " .:-=+*#%@";
     for (int x = 3; x <= 76; ++x) {
         double fx = 100 * pow(40, (x - 3) / 73.0);
         double value = 0;
@@ -2027,35 +2207,17 @@ static void drawTalk(Canvas *canvas, const LiveState *s, double t)
                 value += 0.8 * exp(-pow(log(fx / s->f2) / 0.12, 2));
             value *= s->level;
         }
-        int shade = (int)(fmax(0, fmin(1, value)) * 9 + 0.5);
-        char glyph = shade ? ramp[shade] : '.';
-        putGlyph(canvas, x, 18, &glyph, 1, shade ? inkC : faintC, paperC, false);
+        char glyph = shade(value);
+        bool peak = glyph != ' ';
+        if (!peak)
+            glyph = '.';
+        putGlyph(canvas, x, 18, &glyph, 1, peak ? inkC : faintC, paperC, false);
         put(canvas, x, 19, "-", faintC, false);
     }
     drawText(canvas, 3, 20, "100", dimC, false);
     drawText(canvas, xForHz(1000) - 1, 20, "1k", dimC, false);
     drawText(canvas, 74, 20, "4k", dimC, false);
     drawText(canvas, 25, 20, "two tones, one motor, no speaker", midC, false);
-}
-
-enum { rollLength = 62, trailLength = 14 };
-static int rollHistory[rollLength];
-static struct { double x, y; } trail[trailLength];
-static int trailCount;
-static int marquee;
-
-static void remember(const LiveState *s, double t)
-{
-    memmove(rollHistory, rollHistory + 1, (rollLength - 1) * sizeof(rollHistory[0]));
-    rollHistory[rollLength - 1] = s->scene == SCENE_SING && t - s->lastPlay < 0.1 ? s->noteRow : -1;
-    if (s->scene == SCENE_TOUCH && s->touchDown) {
-        if (trailCount == trailLength) {
-            memmove(trail, trail + 1, (trailLength - 1) * sizeof(trail[0]));
-            --trailCount;
-        }
-        trail[trailCount].x = s->touchX;
-        trail[trailCount++].y = s->touchY;
-    }
 }
 
 static void drawSing(Canvas *canvas, const LiveState *s)
@@ -2233,6 +2395,22 @@ static void drawSay(Canvas *canvas, const LiveState *s, double t)
     drawText(canvas, 8 + (int)strlen(finish), 19, "· return says it", dimC, false);
 }
 
+static void formatLocalizedInteger(int number, char *buffer, size_t size)
+{
+    CFLocaleRef locale = CFLocaleCopyCurrent();
+    CFNumberFormatterRef formatter = CFNumberFormatterCreate(NULL, locale, kCFNumberFormatterDecimalStyle);
+    CFStringRef formatted = formatter
+        ? CFNumberFormatterCreateStringWithValue(NULL, formatter, kCFNumberIntType, &number)
+        : NULL;
+    if (!formatted || !CFStringGetCString(formatted, buffer, (CFIndex)size, kCFStringEncodingUTF8))
+        snprintf(buffer, size, "%d", number);
+    if (formatted)
+        CFRelease(formatted);
+    if (formatter)
+        CFRelease(formatter);
+    CFRelease(locale);
+}
+
 static void drawOutro(Canvas *canvas, const LiveState *s, double t)
 {
     char vibrations[48], runtime[32];
@@ -2266,96 +2444,6 @@ static void drawOutro(Canvas *canvas, const LiveState *s, double t)
     }
 }
 
-static const char scrollText[] =
-    "      ·  a90.com presents  NO SPEAKER  ·    the trackpad has no speaker. every sound you hear is its haptic motor, "
-    "driven through MultitouchSupport, a private macOS framework.    range: 100 to 4000 vibrations per second.    voice: "
-    "two formants, retriggered on every pitch beat.    thanks for listening.    a90.com    ";
-static const char *scrollPosition = scrollText;
-
-static const char *nextScrollGlyph(const char *glyph)
-{
-    /* The only multibyte glyph in the scroller is the middle dot. */
-    const char *next = glyph + ((unsigned char)*glyph < 0x80 ? 1 : 2);
-    return *next ? next : scrollText;
-}
-
-static void draw(Canvas *canvas, const LiveState *s, double t)
-{
-    const Cell blank = {.glyph = " ", .fg = 250, .bg = paperC};
-    for (int i = 0; i < canvasArea; ++i)
-        canvas->cells[i] = blank;
-
-    const char presents[] = "a90.com presents";
-    int width = logoWidth();
-    int left = (canvasWidth - width) / 2;
-    int side = (width - ((int)sizeof(presents) - 1) - 4) / 2;
-    int rightStart = left + side + (int)sizeof(presents) + 3;
-    for (int x = left; x < left + side; ++x)
-        put(canvas, x, 0, "─", dimC, false);
-    for (int x = rightStart; x < left + width; ++x)
-        put(canvas, x, 0, "─", dimC, false);
-    drawText(canvas, left + side + 2, 0, presents, bodyC, true);
-    drawLogo(canvas, 2);
-
-    switch (s->scene) {
-    case SCENE_INTRO:
-        drawSplash(canvas, s, t);
-        return;
-    case SCENE_HEART:
-        drawHeart(canvas, s, t);
-        break;
-    case SCENE_SWEEP:
-        drawSweep(canvas, s, t);
-        break;
-    case SCENE_TALK:
-        drawTalk(canvas, s, t);
-        break;
-    case SCENE_SING:
-        drawSing(canvas, s);
-        break;
-    case SCENE_BEAT:
-    case SCENE_RAP:
-        drawBeat(canvas, s, t);
-        break;
-    case SCENE_YOUR_TURN:
-        drawYourTurn(canvas, s, t);
-        break;
-    case SCENE_TOUCH:
-        drawTouch(canvas, s, t);
-        break;
-    case SCENE_SAY:
-        drawSay(canvas, s, t);
-        break;
-    case SCENE_OUTRO:
-        drawOutro(canvas, s, t);
-        break;
-    }
-
-    char badge[32], frequency[32], bar[11];
-    snprintf(badge, sizeof(badge), " %02d/%02d ", s->part, partCount);
-    canvasText(canvas, 1, 21, badge, paperC, inkC, true);
-    drawText(canvas, 2 + (int)strlen(badge), 21, s->partName, inkC, true);
-    bool active = t - s->lastPlay < 0.08;
-    drawText(canvas, 24, 21, "motor", dimC, false);
-    snprintf(frequency, sizeof(frequency), "%4.0f hz", s->hz);
-    drawText(canvas, 30, 21, active ? frequency : "idle", active ? inkC : dimC, active);
-    asciiBar(active ? s->level : 0, 10, bar);
-    drawText(canvas, 38, 21, bar, bodyC, false);
-    if (s->muted >= 0) {
-        const char *chip = s->muted ? " SPEAKERS MUTED " : " SPEAKERS ON · MUTE ";
-        bool blink = !s->muted && (int)(t * 2.5) % 2 == 0;
-        canvasText(canvas, 79 - textLength(chip), 21, chip,
-                   blink ? inkC : paperC, blink ? faintC : inkC, true);
-    }
-    drawText(canvas, 2, 22, "space skip · q end", faintC, false);
-    const char *glyph = scrollPosition;
-    for (int x = 0; x < canvasWidth; ++x) {
-        size_t length = (unsigned char)*glyph < 0x80 ? 1 : 2;
-        putGlyph(canvas, x, 23, glyph, length, shimmer((x + marquee) / 2), paperC, true);
-        glyph = nextScrollGlyph(glyph);
-    }
-}
-
 static _Atomic bool renderRunning;
 static pthread_t renderer;
 
@@ -2367,9 +2455,9 @@ static void *renderMain(void *unused)
     int lastW = 0, lastH = 0;
     unsigned int frameCount = 0;
     double lastMutePoll = -9;
-    double next = nowSeconds();
+    double next = now();
     while (renderRunning) {
-        double t = nowSeconds();
+        double t = now();
         ++frameCount;
         LiveState s = snapshot();
         remember(&s, t);
@@ -2377,7 +2465,7 @@ static void *renderMain(void *unused)
             lastMutePoll = t;
             int muted = speakersMuted();
             lockLive();
-            state.muted = muted;
+            liveState.muted = muted;
             unlockLive();
         }
         int w, h;
@@ -2397,11 +2485,11 @@ static void *renderMain(void *unused)
             scrollPosition = nextScrollGlyph(scrollPosition);
         }
         next += s.waitingForKey ? 0.125 : 1.0 / 24;
-        double wait = next - nowSeconds();
+        double wait = next - now();
         if (wait > 0)
             usleep((useconds_t)(wait * 1e6));
         else
-            next = nowSeconds();
+            next = now();
     }
     return NULL;
 }
@@ -2424,6 +2512,7 @@ static void stopRenderer(void)
     renderRunning = false;
     pthread_join(renderer, NULL);
 }
+
 // Keyboard input for the interactive show.
 static atomic_bool keysRunning;
 static pthread_t keyboardThread;
@@ -2471,18 +2560,18 @@ static void *readKeys(void *unused)
             if (key == 27 && skipEscapeSequence())
                 continue;
             lockLive();
-            size_t length = strlen(state.inputText);
+            size_t length = strlen(liveState.inputText);
             if (key == 27)
-                state.inputDone = true;
+                liveState.inputDone = true;
             else if (key == '\r' || key == '\n')
-                state.inputSubmitted = true;
+                liveState.inputSubmitted = true;
             else if (key == '\t' && length == 0)
-                snprintf(state.inputText, sizeof(state.inputText), "%s", saySuggestion(nowSeconds()));
+                snprintf(liveState.inputText, sizeof(liveState.inputText), "%s", saySuggestion(now()));
             else if ((key == 127 || key == 8) && length)
-                state.inputText[length - 1] = '\0';
+                liveState.inputText[length - 1] = '\0';
             else if (key >= 32 && key <= 126 && length < 70) {
-                state.inputText[length] = (char)key;
-                state.inputText[length + 1] = '\0';
+                liveState.inputText[length] = (char)key;
+                liveState.inputText[length + 1] = '\0';
             }
             unlockLive();
             continue;
@@ -2498,7 +2587,7 @@ static void *readKeys(void *unused)
             if (!profileChild && posix_spawn(&child, arguments[0], NULL, NULL, arguments, environ) == 0)
                 profileChild = child;
             lockLive();
-            state.followOpenedAt = nowSeconds();
+            liveState.followOpenedAt = now();
             unlockLive();
             continue;
         }
@@ -2526,43 +2615,13 @@ static void stopKeys(void)
     pthread_join(keyboardThread, NULL);
 }
 
-static void greetingLine(char line[128])
-{
-    time_t now = time(NULL);
-    struct tm local;
-    int hour = localtime_r(&now, &local) ? local.tm_hour : 12;
-    const char *hello = hour < 5 ? "You're up late." :
-                        hour < 12 ? "Good morning." :
-                        hour < 17 ? "Good afternoon." :
-                        hour < 22 ? "Good evening." : "You're up late.";
-    snprintf(line, 128, "%s I'm your trackpad. I don't have a speaker. I've been meaning to say something.", hello);
-}
+// MARK: - The show
 
-static void signOff(const char *program, int seconds, int actuations)
-{
-    char vibrations[64];
-    formatLocalizedInteger(actuations, vibrations, sizeof(vibrations));
-    const char *home = getenv("HOME");
-    const char *me = strchr(program, '/') ? program : "nospeaker";
-    size_t homeLength = home ? strlen(home) : 0;
-    bool shorten = homeLength && strncmp(me, home, homeLength) == 0 && me[homeLength] == '/';
-    const char *prefix = shorten ? "~" : "";
-    if (shorten)
-        me += homeLength;
-
-    puts("");
-    printLogoLockup();
-    puts("");
-    printf("  \033[1m%d:%02d\033[0m  ·  \033[1m%s\033[0m vibrations  ·  \033[1m0\033[0m speakers used\n",
-           seconds / 60, seconds % 60, vibrations);
-    puts("  more        \033[1mx.com/codycollier\033[0m");
-    printf("  play again  \033[2m%s%s\033[0m\n", prefix, me);
-    printf("  say a line  \033[2m%s%s \"hello there\"\033[0m\n\n", prefix, me);
-}
+static void signOff(const char *program, int seconds, int actuations);
 
 static void show(const char *program, bool visuals)
 {
-    state.started = nowSeconds();
+    liveState.started = now();
     if (visuals) {
         if (!takeTerminal())
             fail("It couldn't switch the terminal to interactive input.", NULL, 1);
@@ -2574,7 +2633,7 @@ static void show(const char *program, bool visuals)
     enter(SCENE_INTRO, 1, "LOADING");
     if (!visuals)
         puts("a90.com presents NO SPEAKER. Your trackpad doesn't have one. In a moment it's going to talk.");
-    double introStart = nowSeconds();
+    double introStart = now();
     char greeting[128];
     greetingLine(greeting);
     const char *rapLine = "No speaker. No wires. Just a motor and a beat.";
@@ -2585,30 +2644,30 @@ static void show(const char *program, bool visuals)
     const int steps = 2 + (int)(sizeof(voices) / sizeof(*voices));
 
     lockLive();
-    state.stepTotal = steps;
+    liveState.stepTotal = steps;
     unlockLive();
     pauseSeconds(0.6);
     lockLive();
-    state.stepDone = 1;
+    liveState.stepDone = 1;
     unlockLive();
     pauseSeconds(0.5);
     for (int i = 0; i < steps - 2 && !stopRequested; i++) {
         lockLive();
-        state.stepDone = 2 + i;
+        liveState.stepDone = 2 + i;
         unlockLive();
         voices[i] = render(phrases[i]);
     }
     lockLive();
-    state.stepDone = steps;
+    liveState.stepDone = steps;
     unlockLive();
-    pauseSeconds(fmax(0.6, 4.0 - (nowSeconds() - introStart)));
+    pauseSeconds(fmax(0.6, 4.0 - (now() - introStart)));
     if (visuals) {
-        double holdUntil = nowSeconds() + 15;
-        while (speakersMuted() == 0 && !interrupted() && nowSeconds() < holdUntil)
+        double holdUntil = now() + 15;
+        while (speakersMuted() == 0 && !interrupted() && now() < holdUntil)
             usleep(100000);
         if (speakersMuted() == 1) {
             lockLive();
-            state.muted = 1;
+            liveState.muted = 1;
             unlockLive();
             pauseSeconds(1.2);
         }
@@ -2677,13 +2736,13 @@ static void show(const char *program, bool visuals)
             voices[3] = render(byeLine);
         talk(voices[3], byeLine);
         lockLive();
-        state.scene = SCENE_OUTRO;
+        liveState.scene = SCENE_OUTRO;
         unlockLive();
         sparkle();
         if (visuals) {
             keyPressed = false;
             lockLive();
-            state.waitingForKey = true;
+            liveState.waitingForKey = true;
             unlockLive();
             while (!keyPressed && !stopRequested)
                 usleep(20000);
@@ -2700,8 +2759,32 @@ static void show(const char *program, bool visuals)
         stopKeys();
         restoreTerminal();
     }
-    signOff(program, (int)(nowSeconds() - final.started), final.actuations);
+    signOff(program, (int)(now() - final.started), final.actuations);
 }
+
+static void signOff(const char *program, int seconds, int actuations)
+{
+    char vibrations[64];
+    formatLocalizedInteger(actuations, vibrations, sizeof(vibrations));
+    const char *home = getenv("HOME");
+    const char *me = strchr(program, '/') ? program : "nospeaker";
+    size_t homeLength = home ? strlen(home) : 0;
+    bool shorten = homeLength && strncmp(me, home, homeLength) == 0 && me[homeLength] == '/';
+    const char *prefix = shorten ? "~" : "";
+    if (shorten)
+        me += homeLength;
+
+    puts("");
+    printLogoLockup();
+    puts("");
+    printf("  \033[1m%d:%02d\033[0m  ·  \033[1m%s\033[0m vibrations  ·  \033[1m0\033[0m speakers used\n",
+           seconds / 60, seconds % 60, vibrations);
+    puts("  more        \033[1mx.com/codycollier\033[0m");
+    printf("  play again  \033[2m%s%s\033[0m\n", prefix, me);
+    printf("  say a line  \033[2m%s%s \"hello there\"\033[0m\n\n", prefix, me);
+}
+
+// MARK: - Main
 
 // Command line arguments are consumed in the same order as the Swift CLI.
 static int findArgument(int argc, char **argv, const char *name)
@@ -2718,6 +2801,21 @@ static void removeArguments(int *argc, char **argv, int index, int count)
     memmove(argv + index, argv + index + count,
             (size_t)(*argc - index - count + 1) * sizeof(*argv));
     *argc -= count;
+}
+
+static const char *option(int *argc, char **argv, const char *name, const char *example)
+{
+    int index = findArgument(*argc, argv, name);
+    if (!index)
+        return NULL;
+    if (index + 1 >= *argc || argv[index + 1][0] == '-') {
+        char message[128];
+        snprintf(message, sizeof(message), "%s needs a value, like: %s %s", name, name, example);
+        usageError(message);
+    }
+    const char *value = argv[index + 1];
+    removeArguments(argc, argv, index, 2);
+    return value;
 }
 
 static bool flag(int *argc, char **argv, const char *name)
@@ -2750,9 +2848,20 @@ static char *joinWords(int count, char **words)
     return text;
 }
 
+static void closeMotor(void)
+{
+    stopTouch();
+    if (motor) {
+        (void)actuatorClose(motor);
+        CFRelease(motor);
+    }
+    if (deviceList)
+        CFRelease(deviceList);
+    // Keep the private framework mapped until its contact callbacks have exited.
+}
 int main(int argc, char **argv)
 {
-    if (findArgument(argc, argv, "--help") || findArgument(argc, argv, "-h")) {
+    if (flag(&argc, argv, "--help") || flag(&argc, argv, "-h")) {
         puts("NO SPEAKER · a90.com presents\n"
              "Your MacBook's trackpad has no speaker. This makes it talk anyway, through its haptic motor.\n\n"
              "  nospeaker                         the show (space skips a part, q goes to the end)\n"
@@ -2766,15 +2875,9 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    int voiceIndex = findArgument(argc, argv, "--voice");
-    if (voiceIndex) {
-        if (voiceIndex + 1 >= argc || argv[voiceIndex + 1][0] == '-')
-            usageError("--voice needs a value, like: --voice Daniel");
-        voiceName = argv[voiceIndex + 1];
-        removeArguments(&argc, argv, voiceIndex, 2);
-        if (!voiceExists(voiceName))
-            badVoice(voiceName, 64);
-    }
+    voiceName = option(&argc, argv, "--voice", "Daniel");
+    if (voiceName && !voiceExists(voiceName))
+        badVoice(voiceName, 64);
     applyTheme(!flag(&argc, argv, "--dark"));
     bool plain = flag(&argc, argv, "--plain");
     bool wantsSweep = flag(&argc, argv, "--sweep");
@@ -2795,7 +2898,8 @@ int main(int argc, char **argv)
     signal(SIGTERM, onSignal);
     atexit(restoreTerminal);
     atexit(closeMotor);
-    openMotor();
+    loadMultitouchSupport();
+    motor = openMotor();
 
     if (wantsSweep || argc > 1) {
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
