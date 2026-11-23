@@ -78,14 +78,14 @@ typealias CreateList = @convention(c) () -> Unmanaged<CFArray>?
 typealias GetID = @convention(c) (UnsafeMutableRawPointer, UnsafeMutablePointer<UInt64>) -> Int32
 typealias IsBuiltIn = @convention(c) (UnsafeMutableRawPointer) -> Bool
 typealias ActuatorCreate = @convention(c) (UInt64) -> Unmanaged<CFTypeRef>?
-typealias ActuatorOpen = @convention(c) (CFTypeRef) -> Int32
+typealias ActuatorOpen = @convention(c) (CFTypeRef, UInt32) -> Int32
 typealias ActuatorClose = @convention(c) (CFTypeRef) -> Int32
 typealias ActuationCreate = @convention(c) (CFDictionary, Int32) -> UnsafeMutableRawPointer?
 typealias ActuationPlay = @convention(c) (UnsafeMutableRawPointer, UnsafeMutableRawPointer, UInt32, Float, Float) -> Int32
-typealias FrameCallback = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?, Int32, Double, Int32) -> Int32
-typealias RegisterCallback = @convention(c) (UnsafeMutableRawPointer, FrameCallback) -> Void
-typealias DeviceStart = @convention(c) (UnsafeMutableRawPointer, Int32) -> Void
-typealias DeviceStop = @convention(c) (UnsafeMutableRawPointer) -> Void
+typealias FrameCallback = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?, Int32, Double, Int32, UnsafeMutableRawPointer?) -> Int32
+typealias RegisterCallback = @convention(c) (UnsafeMutableRawPointer, FrameCallback) -> Bool
+typealias DeviceStart = @convention(c) (UnsafeMutableRawPointer, Int32) -> Int32
+typealias DeviceStop = @convention(c) (UnsafeMutableRawPointer) -> Int32
 
 let createList = sym("MTDeviceCreateList", CreateList.self)
 let getID = sym("MTDeviceGetDeviceID", GetID.self)
@@ -112,7 +112,19 @@ func macModel() -> String {
     sysctlbyname("hw.model", &buf, &size, nil, 0)
     return String(cString: buf)
 }
-let isLaptop = macModel().hasPrefix("MacBook") || IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery")) != 0
+let isLaptop: Bool = {
+    if macModel().hasPrefix("MacBook") { return true }
+    let port: mach_port_t
+    if #available(macOS 12, *) {
+        port = kIOMainPortDefault
+    } else {
+        port = mach_port_t(0) // IOKit treats a null port as the default.
+    }
+    let service = IOServiceGetMatchingService(port, IOServiceMatching("AppleSmartBattery"))
+    guard service != 0 else { return false }
+    IOObjectRelease(service)
+    return true
+}()
 
 /// Explains, in plain words, why there's no trackpad to play, and what would fix it.
 func noTrackpad(_ found: Bool) -> Never {
@@ -148,7 +160,7 @@ func openMotor() -> CFTypeRef {
     }
     deviceCount = ids.count
     for d in ids.sorted(by: { $0.builtIn && !$1.builtIn }) {
-        if let ref = actuatorCreate(d.id)?.takeRetainedValue(), actuatorOpen(ref) == 0 {
+        if let ref = actuatorCreate(d.id)?.takeRetainedValue(), actuatorOpen(ref, 0) == 0 {
             motorDeviceID = d.id
             motorBuiltIn = d.builtIn
             return ref
@@ -226,7 +238,7 @@ var contact: Contact {
     os_unfair_lock_lock(&touchLock); defer { os_unfair_lock_unlock(&touchLock) }
     return currentContact
 }
-let touchCallback: FrameCallback = { _, data, count, _, _ in
+let touchCallback: FrameCallback = { _, data, count, _, _, _ in
     var best = Contact()
     if let data, count > 0 {
         for i in 0..<Int(count) {
@@ -256,14 +268,14 @@ func startTouch() -> Bool {
     let devs = touchDevices()
     let quiet = !terminalTaken
     if quiet { silenceOthers() }
-    for d in devs { registerCallback(d, touchCallback); deviceStart(d, 0) }
+    for d in devs { _ = registerCallback(d, touchCallback); _ = deviceStart(d, 0) }
     if quiet { usleep(200_000); unsilence() }
     return !devs.isEmpty
 }
 func stopTouch() {
     for d in touchDevices() {
-        unregisterCallback?(d, touchCallback)
-        deviceStop?(d)
+        _ = unregisterCallback?(d, touchCallback)
+        _ = deviceStop?(d)
     }
 }
 
